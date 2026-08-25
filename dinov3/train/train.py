@@ -415,10 +415,14 @@ def do_train(cfg, model, resume=False):
         )
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+
+    grad_accum_steps = getattr(cfg.train, "grad_accum_steps", 1)
+    logger.info(f"Using gradient accumulation: grad_accum_steps={grad_accum_steps}")
+    
     if cfg.multidistillation.enabled:
         global_batch_size = cfg.multidistillation.global_batch_size
     else:
-        global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size()
+        global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size() * grad_accum_steps
 
     # Build data loader
     data_loader = build_multi_resolution_data_loader_from_cfg(
@@ -426,6 +430,9 @@ def do_train(cfg, model, resume=False):
         model=model,
         start_iter=start_iter,
     )
+    
+    # Iterator over the data loader for manual control during gradient accumulation
+    data_iter = iter(data_loader)
 
     # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
@@ -481,8 +488,51 @@ def do_train(cfg, model, resume=False):
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
         # Forward backward
-        optimizer.zero_grad(set_to_none=True)
-        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+        if grad_accum_steps == 1:
+            optimizer.zero_grad(set_to_none=True)
+            total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+
+        else:
+            # ---- GRADIENT ACCUMULATION STARTS HERE ----
+            optimizer.zero_grad(set_to_none=True)
+
+            # We'll log the mean loss/metrics across micro-batches
+            accum_total_loss = 0.0
+            accum_metrics = None
+
+            for accum_idx in range(grad_accum_steps):
+                try:
+                    data = next(data_iter)
+                except StopIteration:
+                    # Just in case, though with INFINITE samplers this shouldn't happen
+                    data_iter = iter(data_loader)
+                    data = next(data_iter)
+
+                # You can think of this as the effective global batch size
+                data["global_batch_size"] = global_batch_size * grad_accum_steps
+
+                # Optionally pass a "micro-iteration" if needed:
+                micro_it = it * grad_accum_steps + accum_idx
+
+                total_loss_micro, metrics_dict_micro = model.forward_backward(
+                    data,
+                    teacher_temp=teacher_temp,
+                    iteration=micro_it,
+                )
+
+                # Accumulate for logging (we don't use this for backprop; forward_backward already did backward)
+                accum_total_loss = accum_total_loss + total_loss_micro
+                if accum_metrics is None:
+                    # clone to avoid in-place issues
+                    accum_metrics = {k: torch.as_tensor(v, dtype=torch.float32, device=total_loss_micro.device).clone()
+                                    for k, v in metrics_dict_micro.items()}
+                else:
+                    for k, v in metrics_dict_micro.items():
+                        accum_metrics[k] += torch.as_tensor(v, dtype=torch.float32, device=total_loss_micro.device)
+
+            # Average across micro-batches for logging
+            total_loss = accum_total_loss / grad_accum_steps
+            metrics_dict = {k: v / grad_accum_steps for k, v in accum_metrics.items()}
 
         # Gradient clipping
         if cfg.optim.clip_grad:
