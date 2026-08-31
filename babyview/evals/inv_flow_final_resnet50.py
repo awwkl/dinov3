@@ -21,7 +21,7 @@ python /ccn2/u/khaiaw/Code/baselines/dinov3/babyview/evals/inv_flow_final.py \
     --flat_points_start_idx 0 \
     --num_flat_points_to_process 100 \
     --data_path=/ccn2/u/ksimon12/flow/miniflow/full_tapvid_davis_first/dataset.json \
-    --model_name awwkl/dinov3-vitl-babyview \
+    --model_name awwkl/dinov3-vitl-babyview-gradaccum1 \
     --model_name facebook/dinov3-vitl16-pretrain-lvd1689m \
     --log_interval=10 \
     --viz_all \
@@ -83,7 +83,7 @@ def get_args(extend=False):
     parser.add_argument(
         '--model_type',
         type=str,
-        choices=['dinov3', 'vjepa2', 'ccwm', 'cwm', 'psi', 'mask_psi'],
+        choices=['dinov3', 'resnet50', 'vjepa2', 'ccwm', 'cwm', 'psi', 'mask_psi'],
         default='ccwm',
     )
     parser.add_argument(
@@ -746,7 +746,7 @@ def main(args):
 
 
     pretrained_model_name = args.model_name
-    if args.model_type == 'dinov3':
+    if args.model_type in ('dinov3', 'resnet50'):
         args.num_rollouts = 1
         
         from transformers import AutoImageProcessor, AutoModel
@@ -757,6 +757,7 @@ def main(args):
             pretrained_model_name, 
             device_map="auto", 
         )
+        model.eval()
         
     img_size = 256
     
@@ -960,9 +961,8 @@ def main(args):
             for rollout_idx in range(args.num_rollouts): 
                 current_seed = args.seed + rollout_idx
 
-                # --- DINOv3 patch features (returns [num_patches, hidden_dim]) ---
+                # --- Patch features for ViT OR ResNet ---
                 device = next(model.parameters()).device
-                num_register = int(getattr(model.config, "num_register_tokens", 0) or getattr(model.config, "num_registers", 0))
 
                 def _to_pil_rgb(np_img: np.ndarray) -> Image.Image:
                     if np_img.ndim == 3 and np_img.shape[-1] >= 3:
@@ -974,39 +974,63 @@ def main(args):
                     pil = _to_pil_rgb(np_img)
 
                     inputs = processor(images=pil, return_tensors="pt").to(device)
-                    pv = inputs["pixel_values"]                  # [1,3,H,W]
-                    H, W = int(pv.shape[-2]), int(pv.shape[-1])  # e.g. 224,224
+                    pv = inputs["pixel_values"]                  # [1,3,H,W] (usually 224x224)
+                    H, W = int(pv.shape[-2]), int(pv.shape[-1])
 
-                    out = model(**inputs, return_dict=True)
+                    # Enable hidden states so we can pick ResNet's 28x28 map
+                    out = model(**inputs, return_dict=True, output_hidden_states=True)
                     toks = out.last_hidden_state
 
-                    start = 1 + num_register if toks.shape[1] >= (1 + num_register) else 0
-                    patch = toks[:, start:, :].squeeze(0).float()  # [num_patches, D]
+                    # ViT-style: [1, N, D] (may have CLS/register tokens)
+                    if toks.ndim == 3:
+                        num_register = int(getattr(model.config, "num_register_tokens", 0) or getattr(model.config, "num_registers", 0))
+                        start = 1 + num_register if toks.shape[1] >= (1 + num_register) else 0
+                        feats = toks[:, start:, :].squeeze(0).float()  # [N, D]
 
-                    return patch
+                    # ResNet-style: use the 28x28 hidden state feature map -> [1, C, 28, 28]
+                    elif toks.ndim == 4:
+                        # Find the feature map with spatial size 28x28
+                        feat_map = next(h for h in out.hidden_states if h.ndim == 4 and h.shape[-2:] == (28, 28))  # [1,C,28,28]
+                        feats = feat_map.squeeze(0).permute(1, 2, 0).reshape(-1, feat_map.shape[1]).float()        # [28*28, C]
 
-                frame1_feat = _extract_patch_feats(query_frame)   # [196, 1024]
-                frame2_feat = _extract_patch_feats(target_frame)  # [196, 1024]
+                    else:
+                        raise ValueError(f"Unexpected last_hidden_state shape: {tuple(toks.shape)}")
 
-                query_x_224 = int((query_x / query_frame.shape[1]) * 224)
-                query_y_224 = int((query_y / query_frame.shape[0]) * 224)
+                    return feats, (H, W)
 
-                # the image uses a 16x16 patch size on a 224x224 image, so we have 14x14 patches
-                n_patches_per_side = int(frame1_feat.shape[0] ** 0.5) # 14
-                query_point_idx = int(query_x_224 // 16 + (query_y_224 // 16) * n_patches_per_side)
-                frame1_feat_query = frame1_feat[query_point_idx] # [1024]
-                
-                # find the idx of the frame2_feat with the highest cosine similarity
-                cos_sim = F.cosine_similarity(frame1_feat_query.unsqueeze(0), frame2_feat, dim=-1) # [256]
-                frame2_target_idx = cos_sim.argmax().item() # get the index of the most similar frame2_feat
-                
-                # convert this to x, y coordinates, by using the centre of the patch
-                itr_rgb_x = (frame2_target_idx % n_patches_per_side) * 16 + 8
-                itr_rgb_y = (frame2_target_idx // n_patches_per_side) * 16 + 8
-                itr_rgb_x = (itr_rgb_x / 224) * query_frame.shape[1]
-                itr_rgb_y = (itr_rgb_y / 224) * query_frame.shape[0]
+                frame1_feat, (H, W) = _extract_patch_feats(query_frame)
+                frame2_feat, _       = _extract_patch_feats(target_frame)
+
+                # Map query pixel (in your working image) -> model input pixel (e.g., 224x224)
+                query_x_m = int((query_x / query_frame.shape[1]) * W)
+                query_y_m = int((query_y / query_frame.shape[0]) * H)
+
+                n_patches_per_side = int(round(frame1_feat.shape[0] ** 0.5))  # 14 (ViT patch16@224) or 28 (ResNet 28x28)
+                patch_f = W / float(n_patches_per_side)                        # 16.0 or 8.0 typically
+
+                qx = int(query_x_m / patch_f)
+                qy = int(query_y_m / patch_f)
+                qx = max(0, min(n_patches_per_side - 1, qx))
+                qy = max(0, min(n_patches_per_side - 1, qy))
+                query_point_idx = qx + qy * n_patches_per_side
+
+                frame1_feat_query = frame1_feat[query_point_idx]  # [D]
+
+                cos_sim = F.cosine_similarity(frame1_feat_query.unsqueeze(0), frame2_feat, dim=-1)  # [N]
+                frame2_target_idx = int(cos_sim.argmax().item())
+
+                # Convert patch index back to model-input pixel coords (use patch center)
+                tx = frame2_target_idx % n_patches_per_side
+                ty = frame2_target_idx // n_patches_per_side
+                itr_x_m = (tx + 0.5) * patch_f
+                itr_y_m = (ty + 0.5) * patch_f
+
+                # Back to your working image coords
+                itr_rgb_x = (itr_x_m / W) * query_frame.shape[1]
+                itr_rgb_y = (itr_y_m / H) * query_frame.shape[0]
                 itr_rgb_epe = np.sqrt((itr_rgb_x - target_x) ** 2 + (itr_rgb_y - target_y) ** 2)
 
+                
                 kl = torch.zeros((img_size // 8, img_size // 8))
                 kl_np = kl.cpu().numpy()
                 itr_kl_x, itr_kl_y = itr_rgb_x, itr_rgb_y
@@ -1015,9 +1039,9 @@ def main(args):
                 kl_epe_logs[data_uid][zoom_itr]['iters'].append(itr_kl_epe)
                 rgb_epe_logs[data_uid][zoom_itr]['iters'].append(itr_rgb_epe)
                 rgb_pred_logs[data_uid][zoom_itr]['iters'].append((itr_rgb_x, itr_rgb_y))
-                
-                # convert cos_sim into a 16x16 map
-                cos_sim_map = cos_sim.reshape(n_patches_per_side, n_patches_per_side).detach().cpu().numpy() # [16, 16]
+
+                # For viz
+                cos_sim_map = cos_sim.reshape(n_patches_per_side, n_patches_per_side).detach().cpu().numpy()
                 cos_sim_maps.append(cos_sim_map)
 
                 if should_viz(counts): 

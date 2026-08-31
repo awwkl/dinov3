@@ -8,9 +8,9 @@ export CUDA_VISIBLE_DEVICES=7
 # num=4861
 # num=9722
 num=54321
-ckpt=facebook/dinov2-large
+# ckpt=facebook/dinov2-large
 # ckpt=facebook/dinov3-vitl16-pretrain-lvd1689m
-# ckpt=awwkl/dinov3-vitl-babyview-gradaccum1
+ckpt=awwkl/dinov3-vitl-babyview-gradaccum1
 
 
 ############
@@ -23,8 +23,11 @@ start=$((idx * num))
 # SAVE_DIR=/ccn2/u/khaiaw/Code/ccwm/viz/flow_counterfactuals/full_tapvid_davis_first/std_${STD}_zoom_${ZOOM_ITERS}
 # datapath=/ccn2/u/ksimon12/flow/miniflow/full_tapvid_davis_first/dataset.json
 
-SAVE_DIR=/ccn2/u/khaiaw/Code/ccwm/viz/flow_counterfactuals/full_tapvid_kubric_first/std_${STD}_zoom_${ZOOM_ITERS}
-datapath=/ccn2/u/ksimon12/flow/miniflow/full_tapvid_kubric_first/dataset.json
+# SAVE_DIR=/ccn2/u/khaiaw/Code/ccwm/viz/flow_counterfactuals/full_tapvid_kubric_first/std_${STD}_zoom_${ZOOM_ITERS}
+# datapath=/ccn2/u/ksimon12/flow/miniflow/full_tapvid_kubric_first/dataset.json
+
+SAVE_DIR=/ccn2/u/khaiaw/Code/ccwm/viz/flow_counterfactuals/flow_stereo_depth/std_${STD}_zoom_${ZOOM_ITERS}
+datapath=/ccn2/u/khaiaw/Code/UniQA-3D/stereo_benchmark/metadata/flow_points.json
 
 cd /ccn2/u/khaiaw/Code/baselines/dinov3
 

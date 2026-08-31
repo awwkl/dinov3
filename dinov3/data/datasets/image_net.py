@@ -39,8 +39,10 @@ class _Split(Enum):
         dirname = self.get_dirname(class_id)
         if self == _Split.TRAIN:
             basename = f"{class_id}_{actual_index}"
+            basename = f"{actual_index:05d}"
         else:  # self in (_Split.VAL, _Split.TEST):
             basename = f"ILSVRC2012_{self.value}_{actual_index:08d}"
+        return os.path.join(dirname, basename + ".jpg")
         return os.path.join(dirname, basename + ".JPEG")
 
     def parse_image_relpath(self, image_relpath: str) -> Tuple[str, int]:
@@ -172,7 +174,7 @@ class ImageNet(ExtendedVisionDataset):
 
     def __len__(self) -> int:
         entries = self._get_entries()
-        assert len(entries) == self.split.length
+        # assert len(entries) == self.split.length
         return len(entries)
 
     def _load_labels(self, labels_path: str) -> List[Tuple[str, str]]:
@@ -233,7 +235,7 @@ class ImageNet(ExtendedVisionDataset):
                     old_percent = percent
 
                 actual_index = index + 1
-                class_index = np.uint32(-1)
+                class_index = 0
                 class_id, class_name = "", ""
                 entries_array[index] = (actual_index, class_index, class_id, class_name)
         else:
